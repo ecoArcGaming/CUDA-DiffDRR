@@ -152,12 +152,21 @@ def _get_xyzs(alpha, source, target, dims, eps):
 def _get_voxel(volume, xyzs, img, mode, align_corners):
     """Wraps torch.nn.functional.grid_sample to sample a volume at XYZ coordinates."""
     batch_size = len(xyzs)
+    if len(volume.shape) == 3:
+        input = volume.permute(2, 1, 0)[None, None].expand(batch_size, -1, -1, -1, -1)
+    else:
+        input = volume.permute(0, 3, 2, 1)[None].expand(batch_size, -1, -1, -1, -1)
+
     voxels = grid_sample(
-        input=volume.permute(2, 1, 0)[None, None].expand(batch_size, -1, -1, -1, -1),
+        input=input,
         grid=xyzs,
         mode=mode,
         align_corners=align_corners,
-    )[:, 0, 0]
+    )
+    if len(volume.shape) == 4:
+        return voxels
+    voxels = voxels[:, 0, 0]
+
     if img is not None:
         img = torch.einsum("bcn, bnj -> bnj", img, voxels)
     else:
@@ -194,7 +203,11 @@ class Trilinear(torch.nn.Module):
         self.eps = eps
 
     def dims(self, volume):
-        return torch.tensor(volume.shape).to(volume)
+        return (
+            torch.tensor(volume.shape).to(volume)
+            if len(torch.tensor(volume.shape)) == 3
+            else torch.tensor(volume.shape[1:]).to(volume)
+        )
 
     def forward(
         self,
@@ -224,6 +237,10 @@ class Trilinear(torch.nn.Module):
 
         # Sample the volume with trilinear interpolation
         img = _get_voxel(volume, xyzs, img, self.mode, align_corners=align_corners)
+
+        # return coordinates for downstream projecting if 4D
+        if len(volume.shape) == 4:
+            return xyzs, img.permute(0, 2, 3, 4, 1)
 
         # Multiply by the step size to compute the rectangular rule for integration
         step_size = (alphamax - alphamin) / (n_points - 1)
