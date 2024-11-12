@@ -240,7 +240,7 @@ class Trilinear(torch.nn.Module):
 
         # return coordinates for downstream projecting if 4D
         if len(volume.shape) == 4:
-            return xyzs, img.permute(0, 2, 3, 4, 1)
+            return (xyzs+1) * dims / 2, img.permute(0, 2, 3, 4, 1)
 
         # Multiply by the step size to compute the rectangular rule for integration
         step_size = (alphamax - alphamin) / (n_points - 1)
