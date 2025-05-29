@@ -6,7 +6,7 @@ __all__ = ['Siddon', 'Trilinear']
 # %% ../notebooks/api/01_renderers.ipynb 3
 import torch
 from torch.nn.functional import grid_sample
-
+from .cuda.siddon import siddon_cuda
 # %% ../notebooks/api/01_renderers.ipynb 7
 class Siddon(torch.nn.Module):
     """Differentiable X-ray renderer implemented with Siddon's method for exact raytracing."""
@@ -37,7 +37,8 @@ class Siddon(torch.nn.Module):
         img,
         align_corners=False,
         mask=None,
-    ):
+    ):  
+        return siddon_cuda.apply(volume, source, target)
         dims = self.dims(volume)
 
         # Calculate the intersections of each ray with the planes comprising the CT volume
@@ -107,17 +108,8 @@ def _get_alphas(source, target, dims, eps, filter_intersections_outside_volume):
 
     # Sort the intersections
     alphas = torch.sort(alphas, dim=-1).values
-    if filter_intersections_outside_volume:
-        alphas = _filter_intersections_outside_volume(alphas, source, target, dims, eps)
     return alphas
 
-
-def _filter_intersections_outside_volume(alphas, source, target, dims, eps):
-    """Remove interesections that are outside of the volume for all rays."""
-    alphamin, alphamax = _get_alpha_minmax(source, target, dims, eps)
-    good_idxs = torch.logical_and(alphamin <= alphas, alphas <= alphamax)
-    alphas = alphas[..., good_idxs.any(dim=[0, 1])]
-    return alphas
 
 
 def _get_alpha_minmax(source, target, dims, eps):
