@@ -2,15 +2,13 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <vector>
-#include <algorithm> // For std::min, std::max
+#include <algorithm>
 
-// CUDA Thrust for sorting
 #include <thrust/sort.h>
 #include <thrust/device_ptr.h>
-#include <thrust/execution_policy.h> // For thrust::device
-#include <c10/cuda/CUDAStream.h> // For c10::cuda::CUDAStream
-#include <c10/cuda/CUDAFunctions.h> // For c10::cuda::getCurrentCUDAStream (and others)
-// CUDA error checking utility
+#include <thrust/execution_policy.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAFunctions.h>
 #define CUDA_CHECK(err)                                                        \
   do {                                                                         \
     cudaError_t err_ = (err);                                                  \
@@ -21,100 +19,31 @@
     }                                                                          \
   } while (0)
 
-// Forward declarations of helper device functions
 __device__ inline float get_voxel_value_trilinear_acf_dhw(
     torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> volume,
-    const float x_grid, // samples Width dimension
-    const float y_grid, // samples Height dimension
-    const float z_grid, // samples Depth dimension
+    const float x_grid,
+    const float y_grid,
+    const float z_grid,
     torch::PackedTensorAccessor32<int, 1, torch::RestrictPtrTraits> dims,
     const float eps);
 
 __device__ inline void accumulate_gradient_trilinear_acf_dhw(
     torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> grad_volume,
     const float grad_sample_value,
-    const float x_grid, // samples Width dimension
-    const float y_grid, // samples Height dimension
-    const float z_grid, // samples Depth dimension
+    const float x_grid,
+    const float y_grid,
+    const float z_grid,
     torch::PackedTensorAccessor32<int, 1, torch::RestrictPtrTraits> dims,
     const float eps);
 
 
-// CUDA kernel for computing alpha intersections
 __global__ void compute_alphas_kernel(
-    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> source_acc, // (Batch, NumRays, 3)
-    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> target_acc, // (Batch, NumRays, 3)
-    torch::PackedTensorAccessor32<int, 1, torch::RestrictPtrTraits> dims_acc,     // (3) -> {Depth, Height, Width}
-    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> alphas_acc, // (Batch, NumRays, MaxAlphas)
+    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> source_acc,
+    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> target_acc,
+    torch::PackedTensorAccessor32<int, 1, torch::RestrictPtrTraits> dims_acc,
+    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> alphas_acc,
     const float eps
 ) {
-    // Global thread index
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    int num_batches = source_acc.size(0);
-    int rays_per_batch = source_acc.size(1);
-    int total_rays = num_batches * rays_per_batch;
-
-    if (idx >= total_rays) {
-        return; // kernel out of bound
-    }
-
-    // Determine batch index and ray index within the batch
-    int b = idx / rays_per_batch;
-    int r = idx % rays_per_batch;
-    float sx = source_acc[b][r][0];
-    float sy = source_acc[b][r][1];
-    float sz = source_acc[b][r][2];
-    float tx = target_acc[b][r][0];
-    float ty = target_acc[b][r][1];
-    float tz = target_acc[b][r][2];
-
-    // Ray directions
-    float dx = tx - sx;
-    float dy = ty - sy;
-    float dz = tz - sz;
-
-    int current_alpha_idx = 0;
-
-    // formulas derived by Vivek
-    for (int i = 0; i <= dims_acc[0]; ++i) { // x-axis
-        if (abs(dx) > eps) {
-            alphas_acc[b][r][current_alpha_idx++] = (static_cast<float>(i) - sx) / dx;
-        } else { // Ray parallel to plane
-             alphas_acc[b][r][current_alpha_idx++] = copysignf(HUGE_VALF, (static_cast<float>(i) - sx));
-        }
-    }
-
-    for (int i = 0; i <= dims_acc[1]; ++i) { // y-axis
-        if (abs(dy) > eps) {
-            alphas_acc[b][r][current_alpha_idx++] = (static_cast<float>(i) - sy) / dy;
-        } else {
-            alphas_acc[b][r][current_alpha_idx++] = copysignf(HUGE_VALF, (static_cast<float>(i) - sy));
-        }
-    }
-
-    for (int i = 0; i <= dims_acc[2]; ++i) { // z-axis
-        if (abs(dz) > eps) {
-            alphas_acc[b][r][current_alpha_idx++] = (static_cast<float>(i) - sz) / dz;
-        } else {
-            alphas_acc[b][r][current_alpha_idx++] = copysignf(HUGE_VALF, (static_cast<float>(i) - sz));
-        }
-    }
-  
-}
-
-// CUDA kernel for computing midpoints and sampling volume
-__global__ void siddon_raycast_kernel(
-    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> volume_acc,    // (Depth, Height, Width)
-    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> source_acc,    // (Batch, NumRays, 3)
-    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> target_acc,    // (Batch, NumRays, 3)
-    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> sorted_alphas_acc, // (Batch, NumRays, MaxAlphas)
-    torch::PackedTensorAccessor32<int, 1, torch::RestrictPtrTraits> dims_acc,        // (3) -> {Depth, Height, Width}
-    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> output_acc,    // (Batch, NumRays, 1)
-    const int num_alphas_per_ray, // Actual number of alphas computed per ray ( D+1 + H+1 + W+1 )
-    const float eps
-) {
-    // Global thread index
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     int num_batches = source_acc.size(0);
@@ -125,11 +54,69 @@ __global__ void siddon_raycast_kernel(
         return;
     }
 
-    // Determine batch index and ray index within the batch
     int b = idx / rays_per_batch;
     int r = idx % rays_per_batch;
+    float sx = source_acc[b][r][0];
+    float sy = source_acc[b][r][1];
+    float sz = source_acc[b][r][2];
+    float tx = target_acc[b][r][0];
+    float ty = target_acc[b][r][1];
+    float tz = target_acc[b][r][2];
 
-    // Source and target coordinates for the current ray
+    float dx = tx - sx;
+    float dy = ty - sy;
+    float dz = tz - sz;
+
+    int current_alpha_idx = 0;
+
+    for (int i = 0; i <= dims_acc[0]; ++i) {
+        if (abs(dx) > eps) {
+            alphas_acc[b][r][current_alpha_idx++] = (static_cast<float>(i) - sx) / dx;
+        } else {
+             alphas_acc[b][r][current_alpha_idx++] = copysignf(HUGE_VALF, (static_cast<float>(i) - sx));
+        }
+    }
+
+    for (int i = 0; i <= dims_acc[1]; ++i) {
+        if (abs(dy) > eps) {
+            alphas_acc[b][r][current_alpha_idx++] = (static_cast<float>(i) - sy) / dy;
+        } else {
+            alphas_acc[b][r][current_alpha_idx++] = copysignf(HUGE_VALF, (static_cast<float>(i) - sy));
+        }
+    }
+
+    for (int i = 0; i <= dims_acc[2]; ++i) {
+        if (abs(dz) > eps) {
+            alphas_acc[b][r][current_alpha_idx++] = (static_cast<float>(i) - sz) / dz;
+        } else {
+            alphas_acc[b][r][current_alpha_idx++] = copysignf(HUGE_VALF, (static_cast<float>(i) - sz));
+        }
+    }
+  
+}
+
+__global__ void siddon_raycast_kernel(
+    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> volume_acc,
+    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> source_acc,
+    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> target_acc,
+    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> sorted_alphas_acc,
+    torch::PackedTensorAccessor32<int, 1, torch::RestrictPtrTraits> dims_acc,
+    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> output_acc,
+    const int num_alphas_per_ray,
+    const float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    int num_batches = source_acc.size(0);
+    int rays_per_batch = source_acc.size(1);
+    int total_rays = num_batches * rays_per_batch;
+
+    if (idx >= total_rays) {
+        return;
+    }
+
+    int b = idx / rays_per_batch;
+    int r = idx % rays_per_batch;
     float sx = source_acc[b][r][0];
     float sy = source_acc[b][r][1];
     float sz = source_acc[b][r][2];
@@ -144,33 +131,27 @@ __global__ void siddon_raycast_kernel(
 
     float accumulated_value = 0.0f;
 
-    // Iterate through pairs of sorted alphas to find segments
     for (int i = 0; i < num_alphas_per_ray - 1; ++i) {
         float alpha1 = sorted_alphas_acc[b][r][i];
         float alpha2 = sorted_alphas_acc[b][r][i+1];
 
-        // Skip if alphas are identical (no segment) or invalid (e.g. inf)
         if (abs(alpha1 - alpha2) < eps || !isfinite(alpha1) || !isfinite(alpha2)) {
             continue;
         }
 
         float alphamid = (alpha1 + alpha2) / 2.0f;
 
-        // out of volume, discard
         if (alphamid < 0.0f || alphamid > 1.0f) {
             continue;
         }
 
-        // in world space
         float mid_x = sx + alphamid * ray_dx;
         float mid_y = sy + alphamid * ray_dy;
         float mid_z = sz + alphamid * ray_dz;
 
-        float x_grid_norm = 2.0f * mid_z / (dims_acc[2] + eps) - 1.0f; // samples Width
-        float y_grid_norm = 2.0f * mid_y / (dims_acc[1] + eps) - 1.0f; // samples Height
-        float z_grid_norm = 2.0f * mid_x / (dims_acc[0] + eps) - 1.0f; // samples Depth
-        
-        // Sample volume using trilinear interpolation
+        float x_grid_norm = 2.0f * mid_z / (dims_acc[2] + eps) - 1.0f;
+        float y_grid_norm = 2.0f * mid_y / (dims_acc[1] + eps) - 1.0f;
+        float z_grid_norm = 2.0f * mid_x / (dims_acc[0] + eps) - 1.0f;
         float voxel_value = get_voxel_value_trilinear_acf_dhw(
             volume_acc, x_grid_norm, y_grid_norm, z_grid_norm, dims_acc, eps
         );
@@ -182,38 +163,28 @@ __global__ void siddon_raycast_kernel(
 }
 
 
-// Forward pass CUDA implementation
 std::vector<torch::Tensor> siddon_fw_cu(
-    torch::Tensor volume,      // (D, H, W)
-    torch::Tensor source,      // (B, N, 3)
-    torch::Tensor target,      // (B, N, 3)
+    torch::Tensor volume,
+    torch::Tensor source,
+    torch::Tensor target,
     const float eps
 ) {
-   
-    // Volume dimensions
     auto D = volume.size(0);
     auto H = volume.size(1);
     auto W = volume.size(2);
     auto dims_vec = std::vector<int64_t>{D, H, W};
     torch::Tensor dims_tensor = torch::tensor(dims_vec, torch::dtype(torch::kInt32).device(volume.device()));
 
-    // Batch and ray dimensions
     auto batch_size = source.size(0);
     auto num_rays_per_batch = source.size(1);
     auto total_rays = batch_size * num_rays_per_batch;
 
-    // Max number of alpha intersections per ray, sum of 3 axes
     int num_alphas_per_ray = (D + 1) + (H + 1) + (W + 1);
-
-    // Allocate alphas tensor: (Batch, NumRays, MaxAlphas)
     torch::Tensor alphas_tensor = torch::empty({batch_size, num_rays_per_batch, num_alphas_per_ray}, 
                                                volume.options());
 
-    // Kernel launch parameters
     const int threads_per_block = 256;
     const int num_blocks = (total_rays + threads_per_block - 1) / threads_per_block;
-
-    // Call compute_alphas_kernel
     compute_alphas_kernel<<<num_blocks, threads_per_block, 0, at::cuda::getCurrentCUDAStream()>>>(
         source.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
         target.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
@@ -223,14 +194,7 @@ std::vector<torch::Tensor> siddon_fw_cu(
     );
     CUDA_CHECK(cudaGetLastError());
 
-    // Sort alphas for all rays using Thrust efficiently
     float* alphas_ptr = alphas_tensor.data_ptr<float>();
-    
-    // Create a single kernel to sort all rays in parallel
-    const int sort_threads_per_block = 256;
-    const int sort_num_blocks = (total_rays + sort_threads_per_block - 1) / sort_threads_per_block;
-    
-    // Launch sorting kernel for all rays in parallel
     thrust::for_each(thrust::cuda::par.on(at::cuda::getCurrentCUDAStream()),
                      thrust::counting_iterator<int>(0),
                      thrust::counting_iterator<int>(total_rays),
@@ -242,17 +206,14 @@ std::vector<torch::Tensor> siddon_fw_cu(
                          thrust::sort(thrust::seq, dev_ptr_ray_alphas_start, 
                                      dev_ptr_ray_alphas_start + num_alphas_per_ray);
                      });
-    CUDA_CHECK(cudaGetLastError()); // Check for errors after Thrust operations
+    CUDA_CHECK(cudaGetLastError());
 
-    // Allocate output tensor: (Batch, NumRays, 1)
     torch::Tensor output_tensor = torch::empty({batch_size, num_rays_per_batch, 1}, volume.options());
-
-    // Call siddon_raycast_kernel
     siddon_raycast_kernel<<<num_blocks, threads_per_block, 0, at::cuda::getCurrentCUDAStream()>>>(
         volume.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
         source.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
         target.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
-        alphas_tensor.packed_accessor32<float, 3, torch::RestrictPtrTraits>(), // alphas_tensor is now sorted
+        alphas_tensor.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
         dims_tensor.packed_accessor32<int, 1, torch::RestrictPtrTraits>(),
         output_tensor.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
         num_alphas_per_ray,
@@ -263,18 +224,16 @@ std::vector<torch::Tensor> siddon_fw_cu(
     return {output_tensor, alphas_tensor};
 }
 
-// Backward pass kernel for volume gradients
 __global__ void siddon_bw_volume_kernel(
-    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> grad_output_acc, // (Batch, NumRays, 1)
-    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> source_acc,      // (Batch, NumRays, 3)
-    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> target_acc,      // (Batch, NumRays, 3)
-    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> sorted_alphas_acc, // (Batch, NumRays, MaxAlphas)
-    torch::PackedTensorAccessor32<int, 1, torch::RestrictPtrTraits> dims_acc,          // (3) -> {Depth, Height, Width}
-    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> grad_volume_acc, // (Depth, Height, Width)
+    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> grad_output_acc,
+    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> source_acc,
+    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> target_acc,
+    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> sorted_alphas_acc,
+    torch::PackedTensorAccessor32<int, 1, torch::RestrictPtrTraits> dims_acc,
+    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> grad_volume_acc,
     const int num_alphas_per_ray,
     const float eps
 ) {
-    // Global thread index
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     int num_batches = source_acc.size(0);
@@ -285,14 +244,10 @@ __global__ void siddon_bw_volume_kernel(
         return;
     }
 
-    // Determine batch index and ray index within the batch
     int b = idx / rays_per_batch;
     int r = idx % rays_per_batch;
 
-    // Gradient for the current ray's output
     float grad_out_ray = grad_output_acc[b][r][0];
-
-    // Source and target coordinates for the current ray
     float sx = source_acc[b][r][0];
     float sy = source_acc[b][r][1];
     float sz = source_acc[b][r][2];
@@ -305,7 +260,6 @@ __global__ void siddon_bw_volume_kernel(
     float ray_dy = ty - sy;
     float ray_dz = tz - sz;
 
-    // Iterate through pairs of sorted alphas (segments)
     for (int i = 0; i < num_alphas_per_ray - 1; ++i) {
         float alpha1 = sorted_alphas_acc[b][r][i];
         float alpha2 = sorted_alphas_acc[b][r][i+1];
@@ -320,23 +274,16 @@ __global__ void siddon_bw_volume_kernel(
             continue;
         }
         
-        // Calculate midpoint XYZ coordinates in world space
         float mid_x = sx + alphamid * ray_dx;
         float mid_y = sy + alphamid * ray_dy;
         float mid_z = sz + alphamid * ray_dz;
 
-        // Normalize coordinates for grid sampling
-        float x_grid_norm = 2.0f * mid_z / (dims_acc[2] + eps) - 1.0f; // samples Width
-        float y_grid_norm = 2.0f * mid_y / (dims_acc[1] + eps) - 1.0f; // samples Height
-        float z_grid_norm = 2.0f * mid_x / (dims_acc[0] + eps) - 1.0f; // samples Depth
+        float x_grid_norm = 2.0f * mid_z / (dims_acc[2] + eps) - 1.0f;
+        float y_grid_norm = 2.0f * mid_y / (dims_acc[1] + eps) - 1.0f;
+        float z_grid_norm = 2.0f * mid_x / (dims_acc[0] + eps) - 1.0f;
 
-        // parametric length
         float intersection_parametric_length = alpha2 - alpha1;
-
-        // Grad of output w.r.t. this specific voxel_value sample
         float grad_sample_value = grad_out_ray * intersection_parametric_length;
-        
-        // Accumulate gradient to volume using adjoint of trilinear interpolation
         accumulate_gradient_trilinear_acf_dhw(
             grad_volume_acc, grad_sample_value,
             x_grid_norm, y_grid_norm, z_grid_norm,
@@ -346,18 +293,14 @@ __global__ void siddon_bw_volume_kernel(
 }
 
 
-// Backward pass CUDA implementation
 torch::Tensor siddon_bw_cu(
-    torch::Tensor grad_output, // (B, N, 1)
-    torch::Tensor volume,      // (D, H, W) - needed for dims and device
-    torch::Tensor source,      // (B, N, 3) - needed for recomputing alphas or passing sorted
-    torch::Tensor target,      // (B, N, 3)
-    torch::Tensor sorted_alphas, // (B, N, MaxAlphas) - Pass from forward or recompute
+    torch::Tensor grad_output,
+    torch::Tensor volume,
+    torch::Tensor source,
+    torch::Tensor target,
+    torch::Tensor sorted_alphas,
     const float eps
 ) {
-   
-
-    // Volume dimensions
     auto D = volume.size(0);
     auto H = volume.size(1);
     auto W = volume.size(2);
@@ -367,18 +310,14 @@ torch::Tensor siddon_bw_cu(
     int num_alphas_per_ray = (D + 1) + (H + 1) + (W + 1);
     TORCH_CHECK(sorted_alphas.size(2) == num_alphas_per_ray, "sorted_alphas last dim mismatch");
 
-    //  grad_volume tensor
     torch::Tensor grad_volume = torch::zeros_like(volume);
 
     auto batch_size = source.size(0);
     auto num_rays_per_batch = source.size(1);
     auto total_rays = batch_size * num_rays_per_batch;
 
-    // Kernel launch parameters
     const int threads_per_block = 256;
     const int num_blocks = (total_rays + threads_per_block - 1) / threads_per_block;
-
-    // Call siddon_bw_volume_kernel
     siddon_bw_volume_kernel<<<num_blocks, threads_per_block, 0, at::cuda::getCurrentCUDAStream()>>>(
         grad_output.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
         source.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
@@ -391,90 +330,21 @@ torch::Tensor siddon_bw_cu(
     );
     CUDA_CHECK(cudaGetLastError());
 
-    // Gradients for source and target are not computed here.
-    return grad_volume; // grad_volume, grad_source (nullptr), grad_target (nullptr)
+    return grad_volume;
 }
 
 
-// Helper device function for trilinear interpolation (align_corners=False)
-// Grid coords (x_grid, y_grid, z_grid) sample Width, Height, Depth dimensions respectively.
-// Volume is indexed as volume[depth_idx][height_idx][width_idx].
-// dims are [Depth, Height, Width].
 __device__ inline float get_voxel_value_trilinear_acf_dhw(
     torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> volume,
-    const float x_grid, // samples Width dimension
-    const float y_grid, // samples Height dimension
-    const float z_grid, // samples Depth dimension
+    const float x_grid,
+    const float y_grid,
+    const float z_grid,
     torch::PackedTensorAccessor32<int, 1, torch::RestrictPtrTraits> dims,
     const float eps) {
 
-    float D_size = dims[0]; // Depth
-    float H_size = dims[1]; // Height
-    float W_size = dims[2]; // Width
-
-    // Unnormalize grid coordinates and shift to voxel centers
-    // x_voxel_f samples Width dimension, range [-0.5, W_size - 0.5]
-    float x_voxel_f = (x_grid + 1.0f) / 2.0f * W_size - 0.5f;
-    float y_voxel_f = (y_grid + 1.0f) / 2.0f * H_size - 0.5f;
-    float z_voxel_f = (z_grid + 1.0f) / 2.0f * D_size - 0.5f;
-
-    int x0_w = floorf(x_voxel_f); // Width index
-    int y0_h = floorf(y_voxel_f); // Height index
-    int z0_d = floorf(z_voxel_f); // Depth index
-
-    // Fractional parts
-    float xd_frac = x_voxel_f - x0_w; 
-    float yd_frac = y_voxel_f - y0_h; 
-    float zd_frac = z_voxel_f - z0_d; 
-
-    float c[2][2][2]; // c[dz][dy][dx]
-
-    for (int dz_i = 0; dz_i < 2; ++dz_i) {
-        for (int dy_i = 0; dy_i < 2; ++dy_i) {
-            for (int dx_i = 0; dx_i < 2; ++dx_i) {
-                int current_d = z0_d + dz_i;
-                int current_h = y0_h + dy_i;
-                int current_w = x0_w + dx_i;
-                if (current_d >= 0 && current_d < D_size &&
-                    current_h >= 0 && current_h < H_size &&
-                    current_w >= 0 && current_w < W_size) {
-                    c[dz_i][dy_i][dx_i] = volume[current_d][current_h][current_w];
-                } else {
-                    c[dz_i][dy_i][dx_i] = 0.0f; // Boundary condition: zero padding
-                }
-            }
-        }
-    }
-    
-    // Interpolate along x (Width)
-    float c00 = c[0][0][0] * (1.0f - xd_frac) + c[0][0][1] * xd_frac;
-    float c01 = c[0][1][0] * (1.0f - xd_frac) + c[0][1][1] * xd_frac;
-    float c10 = c[1][0][0] * (1.0f - xd_frac) + c[1][0][1] * xd_frac;
-    float c11 = c[1][1][0] * (1.0f - xd_frac) + c[1][1][1] * xd_frac;
-
-    // Interpolate along y (Height)
-    float c0 = c00 * (1.0f - yd_frac) + c01 * yd_frac;
-    float c1 = c10 * (1.0f - yd_frac) + c11 * yd_frac;
-
-    // Interpolate along z (Depth)
-    float val = c0 * (1.0f - zd_frac) + c1 * zd_frac;
-    
-    return val;
-}
-
-// Helper device function for accumulating gradients for trilinear interpolation
-__device__ inline void accumulate_gradient_trilinear_acf_dhw(
-    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> grad_volume,
-    const float grad_sample_value,
-    const float x_grid, // samples Width dimension
-    const float y_grid, // samples Height dimension
-    const float z_grid, // samples Depth dimension
-    torch::PackedTensorAccessor32<int, 1, torch::RestrictPtrTraits> dims,
-    const float eps) {
-
-    float D_size = dims[0]; // Depth
-    float H_size = dims[1]; // Height
-    float W_size = dims[2]; // Width
+    float D_size = dims[0];
+    float H_size = dims[1];
+    float W_size = dims[2];
 
     float x_voxel_f = (x_grid + 1.0f) / 2.0f * W_size - 0.5f;
     float y_voxel_f = (y_grid + 1.0f) / 2.0f * H_size - 0.5f;
@@ -488,17 +358,73 @@ __device__ inline void accumulate_gradient_trilinear_acf_dhw(
     float yd_frac = y_voxel_f - y0_h;
     float zd_frac = z_voxel_f - z0_d;
 
-    // Gradients w.r.t. c0 and c1 (intermediate values in z-interpolation)
+    float c[2][2][2];
+
+    for (int dz_i = 0; dz_i < 2; ++dz_i) {
+        for (int dy_i = 0; dy_i < 2; ++dy_i) {
+            for (int dx_i = 0; dx_i < 2; ++dx_i) {
+                int current_d = z0_d + dz_i;
+                int current_h = y0_h + dy_i;
+                int current_w = x0_w + dx_i;
+                if (current_d >= 0 && current_d < D_size &&
+                    current_h >= 0 && current_h < H_size &&
+                    current_w >= 0 && current_w < W_size) {
+                    c[dz_i][dy_i][dx_i] = volume[current_d][current_h][current_w];
+                } else {
+                    c[dz_i][dy_i][dx_i] = 0.0f;
+                }
+            }
+        }
+    }
+    
+    float c00 = c[0][0][0] * (1.0f - xd_frac) + c[0][0][1] * xd_frac;
+    float c01 = c[0][1][0] * (1.0f - xd_frac) + c[0][1][1] * xd_frac;
+    float c10 = c[1][0][0] * (1.0f - xd_frac) + c[1][0][1] * xd_frac;
+    float c11 = c[1][1][0] * (1.0f - xd_frac) + c[1][1][1] * xd_frac;
+
+    float c0 = c00 * (1.0f - yd_frac) + c01 * yd_frac;
+    float c1 = c10 * (1.0f - yd_frac) + c11 * yd_frac;
+
+    float val = c0 * (1.0f - zd_frac) + c1 * zd_frac;
+    
+    return val;
+}
+
+__device__ inline void accumulate_gradient_trilinear_acf_dhw(
+    torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> grad_volume,
+    const float grad_sample_value,
+    const float x_grid,
+    const float y_grid,
+    const float z_grid,
+    torch::PackedTensorAccessor32<int, 1, torch::RestrictPtrTraits> dims,
+    const float eps) {
+
+    float D_size = dims[0];
+    float H_size = dims[1];
+    float W_size = dims[2];
+
+    float x_voxel_f = (x_grid + 1.0f) / 2.0f * W_size - 0.5f;
+    float y_voxel_f = (y_grid + 1.0f) / 2.0f * H_size - 0.5f;
+    float z_voxel_f = (z_grid + 1.0f) / 2.0f * D_size - 0.5f;
+
+    int x0_w = floorf(x_voxel_f);
+    int y0_h = floorf(y_voxel_f);
+    int z0_d = floorf(z_voxel_f);
+
+    float xd_frac = x_voxel_f - x0_w;
+    float yd_frac = y_voxel_f - y0_h;
+    float zd_frac = z_voxel_f - z0_d;
+
+    // Gradients w.r.t. c0 and c1 
     float grad_c0 = grad_sample_value * (1.0f - zd_frac);
     float grad_c1 = grad_sample_value * zd_frac;
 
-    // Gradients w.r.t. c00, c01, c10, c11 (intermediate values in y-interpolation)
+    // Gradients w.r.t. c00, c01, c10, c11 
     float grad_c00 = grad_c0 * (1.0f - yd_frac);
     float grad_c01 = grad_c0 * yd_frac;
     float grad_c10 = grad_c1 * (1.0f - yd_frac);
     float grad_c11 = grad_c1 * yd_frac;
 
-    // Loop over the 8 corner voxels
     for (int dz_i = 0; dz_i < 2; ++dz_i) { // Corresponds to z0_d, z0_d+1
         for (int dy_i = 0; dy_i < 2; ++dy_i) { // Corresponds to y0_h, y0_h+1
             for (int dx_i = 0; dx_i < 2; ++dx_i) { // Corresponds to x0_w, x0_w+1
@@ -514,7 +440,6 @@ __device__ inline void accumulate_gradient_trilinear_acf_dhw(
                     float w_dy = (dy_i == 0) ? (1.0f - yd_frac) : yd_frac;
                     float w_dz = (dz_i == 0) ? (1.0f - zd_frac) : zd_frac;
                     
-                    // Compute correct gradient contribution for this corner voxel
                     // Derivative of trilinear interpolation w.r.t. corner c[dz_i][dy_i][dx_i]
                     float grad_contrib_to_corner = grad_sample_value *
                                                    ((dz_i == 0) ? (1.0f - zd_frac) : zd_frac) *
@@ -528,9 +453,5 @@ __device__ inline void accumulate_gradient_trilinear_acf_dhw(
     }
 }
 
-// Pybind11 module definition (example, if you were to build this as an extension)
-// PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-//   m.def("siddon_forward", &siddon_fw_cu, "Siddon forward (CUDA)");
-//   m.def("siddon_backward", &siddon_bw_cu, "Siddon backward (CUDA)");
-// }
+
 
