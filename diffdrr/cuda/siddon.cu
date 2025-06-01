@@ -223,18 +223,25 @@ std::vector<torch::Tensor> siddon_fw_cu(
     );
     CUDA_CHECK(cudaGetLastError());
 
-    // Sort alphas for each ray using Thrust (in-place)
+    // Sort alphas for all rays using Thrust efficiently
     float* alphas_ptr = alphas_tensor.data_ptr<float>();
-    for (int b = 0; b < batch_size; ++b) {
-        for (int r = 0; r < num_rays_per_batch; ++r) {
-            float* ray_alphas_start = alphas_ptr + (b * num_rays_per_batch + r) * num_alphas_per_ray;
-            thrust::device_ptr<float> dev_ptr_ray_alphas_start(ray_alphas_start);
-            // Using thrust::device execution policy with current stream
-            thrust::sort(thrust::cuda::par.on(at::cuda::getCurrentCUDAStream()), 
-                         dev_ptr_ray_alphas_start, 
-                         dev_ptr_ray_alphas_start + num_alphas_per_ray);
-        }
-    }
+    
+    // Create a single kernel to sort all rays in parallel
+    const int sort_threads_per_block = 256;
+    const int sort_num_blocks = (total_rays + sort_threads_per_block - 1) / sort_threads_per_block;
+    
+    // Launch sorting kernel for all rays in parallel
+    thrust::for_each(thrust::cuda::par.on(at::cuda::getCurrentCUDAStream()),
+                     thrust::counting_iterator<int>(0),
+                     thrust::counting_iterator<int>(total_rays),
+                     [=] __device__ (int ray_idx) {
+                         int b = ray_idx / num_rays_per_batch;
+                         int r = ray_idx % num_rays_per_batch;
+                         float* ray_alphas_start = alphas_ptr + ray_idx * num_alphas_per_ray;
+                         thrust::device_ptr<float> dev_ptr_ray_alphas_start(ray_alphas_start);
+                         thrust::sort(thrust::seq, dev_ptr_ray_alphas_start, 
+                                     dev_ptr_ray_alphas_start + num_alphas_per_ray);
+                     });
     CUDA_CHECK(cudaGetLastError()); // Check for errors after Thrust operations
 
     // Allocate output tensor: (Batch, NumRays, 1)
@@ -303,10 +310,9 @@ __global__ void siddon_bw_volume_kernel(
         float alpha1 = sorted_alphas_acc[b][r][i];
         float alpha2 = sorted_alphas_acc[b][r][i+1];
 
-        if (abs(alpha1 - alpha2) < eps || !isfinite(alpha1) || !isfinite(alpha2)) {
+        if (abs(alpha1 - alpha2) < eps || !isfinite(alpha1) || !isfinite(alpha2) || alpha1 >= alpha2) {
             continue;
         }
-        if (alpha1 >= alpha2) continue;
 
         float alphamid = (alpha1 + alpha2) / 2.0f;
 
@@ -508,30 +514,8 @@ __device__ inline void accumulate_gradient_trilinear_acf_dhw(
                     float w_dy = (dy_i == 0) ? (1.0f - yd_frac) : yd_frac;
                     float w_dz = (dz_i == 0) ? (1.0f - zd_frac) : zd_frac;
                     
-                    // This is the gradient of the output value w.r.t specific corner c[dz_i][dy_i][dx_i]
-                    // Need to chain rule from grad_c00, etc.
-                    float grad_corner_val;
-                    if (dz_i == 0) { // affects c0
-                        if (dy_i == 0) { // affects c00
-                            grad_corner_val = grad_c00 * ((dx_i == 0) ? (1.0f - xd_frac) : xd_frac);
-                        } else { // affects c01
-                            grad_corner_val = grad_c01 * ((dx_i == 0) ? (1.0f - xd_frac) : xd_frac);
-                        }
-                    } else { // affects c1
-                        if (dy_i == 0) { // affects c10
-                            grad_corner_val = grad_c10 * ((dx_i == 0) ? (1.0f - xd_frac) : xd_frac);
-                        } else { // affects c11
-                            grad_corner_val = grad_c11 * ((dx_i == 0) ? (1.0f - xd_frac) : xd_frac);
-                        }
-                    }
-                    // The above logic for grad_corner_val is incorrect. Simpler:
-                    // Derivative of `val` w.r.t. `c[dz_i][dy_i][dx_i]`
-                    float weight = w_dx * w_dy * w_dz; // This is not correct either
-                    
-                    // Correct weights for gradient distribution:
-                    // d(val)/d(c[0][0][0]) = (1-zd_frac)(1-yd_frac)(1-xd_frac)
-                    // d(val)/d(c[0][0][1]) = (1-zd_frac)(1-yd_frac)(xd_frac)
-                    // ... and so on for all 8 corners.
+                    // Compute correct gradient contribution for this corner voxel
+                    // Derivative of trilinear interpolation w.r.t. corner c[dz_i][dy_i][dx_i]
                     float grad_contrib_to_corner = grad_sample_value *
                                                    ((dz_i == 0) ? (1.0f - zd_frac) : zd_frac) *
                                                    ((dy_i == 0) ? (1.0f - yd_frac) : yd_frac) *
