@@ -13,6 +13,7 @@ class Siddon(torch.nn.Module):
 
     def __init__(
         self,
+        kernel: str = "cuda",  # Rendering kernel, either "cuda" or "pytorch"
         mode: str = "nearest",  # Interpolation mode for grid_sample
         stop_gradients_through_grid_sample: bool = False,  # Apply torch.no_grad when calling grid_sample
         filter_intersections_outside_volume: bool = True,  # Use alphamin/max to filter the intersections
@@ -20,6 +21,7 @@ class Siddon(torch.nn.Module):
         eps: float = 1e-8,  # Small constant to avoid div by zero errors
     ):
         super().__init__()
+        self.kernel = kernel
         self.mode = mode
         self.stop_gradients_through_grid_sample = stop_gradients_through_grid_sample
         self.filter_intersections_outside_volume = filter_intersections_outside_volume
@@ -37,58 +39,60 @@ class Siddon(torch.nn.Module):
         img,
         align_corners=False,
         mask=None,
-    ):  
-        return siddon_cuda.apply(volume, source, target)
-        dims = self.dims(volume)
+    ):
+        if self.kernel == "cuda":
+            return siddon_cuda.apply(volume, source, target)
+        elif self.kernel == "pytorch":
+            dims = self.dims(volume)
 
-        # Calculate the intersections of each ray with the planes comprising the CT volume
-        alphas = _get_alphas(
-            source,
-            target,
-            dims,
-            self.eps,
-            self.filter_intersections_outside_volume,
-        )
-
-        # Calculate the midpoint of every pair of adjacent intersections
-        # These midpoints lie exclusively in a single voxel
-        alphamid = (alphas[..., 0:-1] + alphas[..., 1:]) / 2
-
-        # Get the XYZ coordinate of each midpoint (normalized to [-1, +1]^3)
-        xyzs = _get_xyzs(alphamid, source, target, dims, self.eps)
-
-        # Use torch.nn.functional.grid_sample to lookup the values of each intersected voxel
-        if self.stop_gradients_through_grid_sample:
-            with torch.no_grad():
-                img = _get_voxel(
-                    volume, xyzs, img, self.mode, align_corners=align_corners
-                )
-        else:
-            img = _get_voxel(volume, xyzs, img, self.mode, align_corners=align_corners)
-
-        # Weight each intersected voxel by the length of the ray's intersection with the voxel
-        intersection_length = torch.diff(alphas, dim=-1)
-        img = img * intersection_length
-
-        # Handle optional masking
-        if mask is None:
-            img = reduce(img, self.reducefn)
-            img = img.unsqueeze(1)
-        else:
-            # Thanks to @Ivan for the clutch assist w/ pytorch tensor ops
-            # https://stackoverflow.com/questions/78323859/broadcast-pytorch-array-across-channels-based-on-another-array/78324614#78324614
-            B, D, _ = img.shape
-            C = int(mask.max().item() + 1)
-            channels = _get_voxel(
-                mask, xyzs, img=None, mode=self.mode, align_corners=align_corners
-            ).long()
-            img = (
-                torch.zeros(B, C, D)
-                .to(img)
-                .scatter_add_(1, channels.transpose(-1, -2), img.transpose(-1, -2))
+            # Calculate the intersections of each ray with the planes comprising the CT volume
+            alphas = _get_alphas(
+                source,
+                target,
+                dims,
+                self.eps,
+                self.filter_intersections_outside_volume,
             )
 
-        return img
+            # Calculate the midpoint of every pair of adjacent intersections
+            # These midpoints lie exclusively in a single voxel
+            alphamid = (alphas[..., 0:-1] + alphas[..., 1:]) / 2
+
+            # Get the XYZ coordinate of each midpoint (normalized to [-1, +1]^3)
+            xyzs = _get_xyzs(alphamid, source, target, dims, self.eps)
+
+            # Use torch.nn.functional.grid_sample to lookup the values of each intersected voxel
+            if self.stop_gradients_through_grid_sample:
+                with torch.no_grad():
+                    img = _get_voxel(
+                        volume, xyzs, img, self.mode, align_corners=align_corners
+                    )
+            else:
+                img = _get_voxel(volume, xyzs, img, self.mode, align_corners=align_corners)
+
+            # Weight each intersected voxel by the length of the ray's intersection with the voxel
+            intersection_length = torch.diff(alphas, dim=-1)
+            img = img * intersection_length
+
+            # Handle optional masking
+            if mask is None:
+                img = reduce(img, self.reducefn)
+                img = img.unsqueeze(1)
+            else:
+                # Thanks to @Ivan for the clutch assist w/ pytorch tensor ops
+                # https://stackoverflow.com/questions/78323859/broadcast-pytorch-array-across-channels-based-on-another-array/78324614#78324614
+                B, D, _ = img.shape
+                C = int(mask.max().item() + 1)
+                channels = _get_voxel(
+                    mask, xyzs, img=None, mode=self.mode, align_corners=align_corners
+                ).long()
+                img = (
+                    torch.zeros(B, C, D)
+                    .to(img)
+                    .scatter_add_(1, channels.transpose(-1, -2), img.transpose(-1, -2))
+                )
+            return img
+
 
 # %% ../notebooks/api/01_renderers.ipynb 8
 def _get_alphas(source, target, dims, eps, filter_intersections_outside_volume):
