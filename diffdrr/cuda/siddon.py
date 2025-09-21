@@ -4,6 +4,7 @@ from torch.utils.cpp_extension import load
 # build CUDA extension JIT
 siddon_cpp = load(name = 'siddon_cpp', 
                  sources = ['./diffdrr/cuda/siddon.cpp', './diffdrr/cuda/siddon.cu'], 
+                 extra_cuda_cflags=['--extended-lambda'],
                  verbose=True)
 
 # wrapper for gradient computations
@@ -22,6 +23,6 @@ class siddon_cuda(torch.autograd.Function):
 
         dV = siddon_cpp.siddon_bw(grad.contiguous(), volume, source, target, alphas)
 
-        return dV, None
+        return dV, None, None
 
 

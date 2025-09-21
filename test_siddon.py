@@ -5,9 +5,9 @@ from diffdrr.renderers import Siddon
 def test_siddon_performance():
     """Compare the runtime of the CUDA and PyTorch Siddon kernels."""
     volume = torch.randn(128, 128, 128).cuda()
-    source = torch.tensor([[100.0, 0.0, 0.0]]).cuda()
-    target = torch.tensor([[-100.0, 0.0, 0.0]]).cuda()
-    img = torch.zeros(1, 1, 128, 128).cuda()
+    source = torch.tensor([[[100.0, 0.0, 0.0]]]).cuda()
+    target = torch.tensor([[[-100.0, 0.0, 0.0]]]).cuda()
+    img = torch.zeros(1, 128, 128).cuda()
 
     siddon_cuda = Siddon(kernel="cuda")
     siddon_pytorch = Siddon(kernel="pytorch")
@@ -30,3 +30,6 @@ def test_siddon_performance():
 
 if __name__ == "__main__":
     test_siddon_performance()
+    # results: 
+    # CUDA kernel average runtime: 0.0008 seconds                                                                                                                                             │
+ │  # PyTorch kernel average runtime: 0.0037 seconds 
